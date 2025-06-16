@@ -1,7 +1,14 @@
 import math
-from typing import Dict, List, Optional, Union
+import json
+import copy # For deepcopying schemas
+from typing import Dict, List, Optional, Union, Any
 
+from pydantic import BaseModel, Field # Ensure BaseModel and Field are imported
 import tiktoken
+import google.generativeai as genai
+# GenerativeModel is now accessed via genai.GenerativeModel
+from google.generativeai.types import FunctionDeclaration, Tool 
+
 from openai import (
     APIError,
     AsyncAzureOpenAI,
@@ -28,8 +35,24 @@ from app.schema import (
     TOOL_CHOICE_VALUES,
     Message,
     ToolChoice,
+    Function as SchemaFunction, # Import Function and alias it
 )
 
+# Helper Pydantic models for consistent LLM response structure
+class LLMToolCall(BaseModel):
+    id: str
+    type: str = "function"
+    function: SchemaFunction # Use the imported and aliased Function model
+
+class LLMResponseMessage(BaseModel):
+    role: str = "assistant"
+    content: Optional[str] = None
+    tool_calls: Optional[List[LLMToolCall]] = None
+
+    class Config:
+        arbitrary_types_allowed = True
+
+# Models like MULTIMODAL_MODELS, REASONING_MODELS are defined here in the actual file.
 
 REASONING_MODELS = ["o1", "o3-mini"]
 MULTIMODAL_MODELS = [
@@ -179,52 +202,110 @@ class LLM:
     ):
         if config_name not in cls._instances:
             instance = super().__new__(cls)
+            # Initialize the instance immediately after creation and before storing
             instance.__init__(config_name, llm_config)
             cls._instances[config_name] = instance
         return cls._instances[config_name]
 
+    @staticmethod
+    def _sanitize_schema_for_gemini(data: Any) -> Any:
+        """
+        Recursively remove all keys named 'title' or 'default' from a nested dictionary or list of dictionaries.
+        This is used to sanitize JSON schemas for APIs like Gemini that don't support these fields in function parameter schemas.
+        """
+        if isinstance(data, dict):
+            new_dict = {}
+            for k, v in data.items():
+                if k == "title" or k == "default":  # Skip 'title' and 'default' keys
+                    continue
+                new_dict[k] = LLM._sanitize_schema_for_gemini(v)  # Recurse
+            return new_dict
+        elif isinstance(data, list):
+            return [LLM._sanitize_schema_for_gemini(item) for item in data]
+        else:
+            return data
+
     def __init__(
-        self, config_name: str = "default", llm_config: Optional[LLMSettings] = None
-    ):
-        if not hasattr(self, "client"):  # Only initialize if not already initialized
-            llm_config = llm_config or config.llm
-            llm_config = llm_config.get(config_name, llm_config["default"])
-            self.model = llm_config.model
-            self.max_tokens = llm_config.max_tokens
-            self.temperature = llm_config.temperature
-            self.api_type = llm_config.api_type
-            self.api_key = llm_config.api_key
-            self.api_version = llm_config.api_version
-            self.base_url = llm_config.base_url
+        self, config_name: str = "default", llm_config: Optional[LLMSettings] = None):
+            # logger.critical(f"LLM.__INIT__ ENTERED. config_name='{config_name}'")
 
-            # Add token counting related attributes
-            self.total_input_tokens = 0
-            self.total_completion_tokens = 0
-            self.max_input_tokens = (
-                llm_config.max_input_tokens
-                if hasattr(llm_config, "max_input_tokens")
-                else None
-            )
+            if not hasattr(self, "client"):  # Only initialize if not already initialized
+                # Load configuration
+                loaded_llm_config_source = llm_config
+                if not llm_config:
+                    # Assuming 'config' is the global AppConfig instance from app.config
+                    # If config is not always imported at module level, ensure it's available here
+                    from app.config import config as global_app_config
+                    loaded_llm_config_source = global_app_config.llm
 
-            # Initialize tokenizer
-            try:
-                self.tokenizer = tiktoken.encoding_for_model(self.model)
-            except KeyError:
-                # If the model is not in tiktoken's presets, use cl100k_base as default
-                self.tokenizer = tiktoken.get_encoding("cl100k_base")
+                effective_llm_settings = loaded_llm_config_source.get(config_name, loaded_llm_config_source.get("default"))
 
-            if self.api_type == "azure":
-                self.client = AsyncAzureOpenAI(
-                    base_url=self.base_url,
-                    api_key=self.api_key,
-                    api_version=self.api_version,
+                if effective_llm_settings is None:
+                    logger.error("LLM.__INIT__: FAILED to load effective_llm_settings. Aborting.")
+                    raise ValueError("Could not load LLM settings.")
+
+                self.model = effective_llm_settings.model
+                self.max_tokens = effective_llm_settings.max_tokens
+                self.temperature = effective_llm_settings.temperature
+                self.api_type = effective_llm_settings.api_type
+                self.api_key = effective_llm_settings.api_key
+                self.api_version = effective_llm_settings.api_version
+                self.base_url = effective_llm_settings.base_url
+
+                # logger.critical(f"LLM.__INIT__: EFFECTIVE API_TYPE = '{self.api_type}' from config.")
+                logger.info(f"LLM.__init__: Initializing LLM client with api_type='{self.api_type}', model='{self.model}'") # Simplified log
+
+                # Add token counting related attributes
+                self.total_input_tokens = 0
+                self.total_completion_tokens = 0
+                self.max_input_tokens = (
+                    effective_llm_settings.max_input_tokens
+                    if hasattr(effective_llm_settings, "max_input_tokens")
+                    else None
                 )
-            elif self.api_type == "aws":
-                self.client = BedrockClient()
-            else:
-                self.client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url)
 
-            self.token_counter = TokenCounter(self.tokenizer)
+                # Initialize tokenizer
+                try:
+                    self.tokenizer = tiktoken.encoding_for_model(self.model)
+                except KeyError:
+                    # If the model is not in tiktoken's presets, use cl100k_base as default
+                    self.tokenizer = tiktoken.get_encoding("cl100k_base")
+
+                if self.api_type == "azure":
+                    logger.info("LLM.__init__: Configuring for AZURE.")
+                    self.client = AsyncAzureOpenAI(
+                        base_url=self.base_url,
+                        api_key=self.api_key,
+                        api_version=self.api_version,
+                    )
+                elif self.api_type == "aws":
+                    logger.info("LLM.__init__: Configuring for AWS BEDROCK.")
+                    # Assuming BedrockClient is defined elsewhere, e.g., app.bedrock
+                    # from app.bedrock import BedrockClient # If not already imported
+                    # self.client = BedrockClient() # Replace with actual Bedrock client init
+                    logger.warning("LLM.__init__: AWS Bedrock client initialization is a placeholder.")
+                    # self.client = BedrockClient() # Example
+                    pass # Placeholder until BedrockClient is fully integrated
+                elif self.api_type == "google":
+                    logger.info("LLM.__init__: Configuring for GOOGLE/GEMINI.")
+                    try:
+                        genai.configure(api_key=self.api_key)
+                        self.client = genai.GenerativeModel(model_name=self.model)
+                        logger.info(f"LLM.__init__: Successfully configured Gemini client. Type: {type(self.client)}")
+                    except Exception as e:
+                        logger.error(f"LLM.__init__: FAILED to configure Gemini client: {e}", exc_info=True)
+                        raise
+                elif self.api_type == "openai" or not self.api_type: # Default to OpenAI if api_type is 'openai' or empty/None
+                    logger.info(f"LLM.__init__: Configuring for OPENAI (api_type: '{self.api_type}').")
+                    self.client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url)
+                else:
+                    logger.error(f"LLM.__init__: Unsupported api_type: '{self.api_type}'")
+                    raise ValueError(f"Unsupported api_type: {self.api_type}")
+            
+                # logger.info(f"LLM.__init__: Final self.client type: {type(self.client)}")
+                self.token_counter = TokenCounter(self.tokenizer)
+            else:
+                logger.info("LLM.__INIT__: Client already initialized.")
 
     def count_tokens(self, text: str) -> int:
         """Calculate the number of tokens in a text"""
@@ -650,117 +731,270 @@ class LLM:
         tool_choice: TOOL_CHOICE_TYPE = ToolChoice.AUTO,  # type: ignore
         temperature: Optional[float] = None,
         **kwargs,
-    ) -> ChatCompletionMessage | None:
+) -> Any:  # Return type will vary based on API (e.g. ChatCompletionMessage or Gemini response dict)
         """
         Ask LLM using functions/tools and return the response.
 
         Args:
             messages: List of conversation messages
             system_msgs: Optional system messages to prepend
-            timeout: Request timeout in seconds
-            tools: List of tools to use
-            tool_choice: Tool choice strategy
+            timeout: Request timeout in seconds (may not be applicable to all APIs)
+            tools: List of tools to use (expected format may vary by API)
+            tool_choice: Tool choice strategy (interpretation may vary by API)
             temperature: Sampling temperature for the response
             **kwargs: Additional completion arguments
 
         Returns:
-            ChatCompletionMessage: The model's response
+            Model's response, structure depends on the API used.
 
         Raises:
-            TokenLimitExceeded: If token limits are exceeded
-            ValueError: If tools, tool_choice, or messages are invalid
-            OpenAIError: If API call fails after retries
-            Exception: For unexpected errors
+            TokenLimitExceeded: If token limits are exceeded (if checked before API-specific logic)
+            ValueError: If tools, tool_choice, or messages are invalid (if checked before API-specific logic)
+            Exception: For API-specific errors or unexpected issues.
         """
-        try:
-            # Validate tool_choice
-            if tool_choice not in TOOL_CHOICE_VALUES:
-                raise ValueError(f"Invalid tool_choice: {tool_choice}")
+        # logger.critical(f"ASK_TOOL ENTERED. Effective self.api_type='{getattr(self, 'api_type', 'NOT_SET')}'. Client is type: {type(getattr(self, 'client', None))}")
 
-            # Check if the model supports images
-            supports_images = self.model in MULTIMODAL_MODELS
+        # --- COMMON VALIDATIONS AND PREP (IF ANY) ---
+        # Example: tool_choice validation (if its meaning is somewhat generic)
+        if tool_choice not in TOOL_CHOICE_VALUES and not isinstance(tool_choice, dict): # Adjusted for potential dict tool_choice for specific functions
+             logger.warning(f"Potentially invalid tool_choice format: {tool_choice}")
+             # raise ValueError(f\"Invalid tool_choice: {tool_choice}\") # Or handle per API
 
-            # Format messages
-            if system_msgs:
-                system_msgs = self.format_messages(system_msgs, supports_images)
-                messages = system_msgs + self.format_messages(messages, supports_images)
-            else:
-                messages = self.format_messages(messages, supports_images)
+        # Token limit checks and message formatting are often API-specific,
+        # so they will largely be handled within the respective API blocks.
 
-            # Calculate input token count
-            input_tokens = self.count_message_tokens(messages)
+        if self.api_type == "google":
+            logger.info("ASK_TOOL: Executing GOOGLE specific path.")
+            try:
+                # logger.info("ASK_TOOL (Google Path): Preparing to call Gemini.")
 
-            # If there are tools, calculate token count for tool descriptions
-            tools_tokens = 0
-            if tools:
-                for tool in tools:
-                    tools_tokens += self.count_tokens(str(tool))
+                # 1. Format messages for Gemini
+                gemini_messages_for_api = []
+                # Combine system messages and regular messages
+                all_input_messages = (system_msgs or []) + messages
+                if not all_input_messages:
+                    logger.error("ASK_TOOL (Google Path): No messages provided to send to Gemini.")
+                    raise ValueError("Messages list is empty for Gemini call")
 
-            input_tokens += tools_tokens
+                for msg_item in all_input_messages:
+                    # Gemini expects 'user' or 'model' roles. Adapt your Message object's role.
+                    # Assuming msg_item has 'role' and 'content' attributes.
+                    # This is a basic mapping; adjust if your Message structure is different.
+                    role = "user" if msg_item.role in ["user", "system"] else "model"
+                    if not hasattr(msg_item, 'content') or not msg_item.content:
+                        logger.warning(f"ASK_TOOL (Google Path): Skipping message with no content: {msg_item}")
+                        continue
+                    gemini_messages_for_api.append({'role': role, 'parts': [{'text': msg_item.content}]})
 
-            # Check if token limits are exceeded
-            if not self.check_token_limit(input_tokens):
-                error_message = self.get_limit_error_message(input_tokens)
-                # Raise a special exception that won't be retried
-                raise TokenLimitExceeded(error_message)
+                if not gemini_messages_for_api: # Check again after filtering
+                    logger.error("ASK_TOOL (Google Path): No valid messages to send after formatting for Gemini.")
+                    raise ValueError("No valid messages to send to Gemini after formatting.")
 
-            # Validate tools if provided
-            if tools:
-                for tool in tools:
-                    if not isinstance(tool, dict) or "type" not in tool:
-                        raise ValueError("Each tool must be a dict with 'type' field")
+                # 2. Format tools for Gemini
+                gemini_tool_declarations = []
+                if tools:
+                    for mcp_tool_param in tools:
+                        fn_data = mcp_tool_param.get("function")
+                        if fn_data and fn_data.get("name") and fn_data.get("parameters") is not None: # Ensure parameters key exists
+                            original_schema = fn_data["parameters"]
+                            # logger.info(f"ASK_TOOL (Google Path): Processing tool '{fn_data['name']}'. Original parameters schema: {json.dumps(original_schema, indent=2)}")
+                            
+                            # Sanitize the schema by removing "title" and "default" fields
+                            sanitized_schema = LLM._sanitize_schema_for_gemini(original_schema)
+                            # logger.info(f"ASK_TOOL (Google Path): Tool '{fn_data['name']}'. Sanitized parameters schema for Gemini: {json.dumps(sanitized_schema, indent=2)}")
 
-            # Set up the completion request
-            params = {
-                "model": self.model,
-                "messages": messages,
-                "tools": tools,
-                "tool_choice": tool_choice,
-                "timeout": timeout,
-                **kwargs,
-            }
+                            # Sanitize tool name for Gemini
+                            original_tool_name = fn_data["name"]
+                            simple_tool_name = original_tool_name # Default to original
 
-            if self.model in REASONING_MODELS:
-                params["max_completion_tokens"] = self.max_tokens
-            else:
-                params["max_tokens"] = self.max_tokens
-                params["temperature"] = (
-                    temperature if temperature is not None else self.temperature
+                            # Define mappings from observed suffixes to simple names
+                            # These simple names should match actual tool capabilities and Gemini requirements.
+                            TOOL_NAME_SUFFIX_MAP = {
+                                "_ba": "bash",
+                                "_br": "browser_use", 
+                                "_st": "str_replace_editor",
+                                "_te": "terminate"
+                            }
+                            
+                            # Attempt to map using suffix if the name seems mangled
+                            # Check for a length that suggests it's a mangled name before trying suffix.
+                            # A simple heuristic: if it contains '/' or is very long.
+                            # For now, we'll rely on the suffix for known mangled forms.
+                            mapped = False
+                            for suffix, mapped_name in TOOL_NAME_SUFFIX_MAP.items():
+                                if original_tool_name.endswith(suffix):
+                                    simple_tool_name = mapped_name
+                                    mapped = True
+                                    break
+                            
+                            if mapped:
+                                # logger.info(f"ASK_TOOL (Google Path): Mapped tool name '{original_tool_name}' to '{simple_tool_name}' for Gemini.")
+                                pass # Name was mapped, proceed
+                            elif simple_tool_name != original_tool_name: # If it was changed by some other logic not shown
+                                # logger.info(f"ASK_TOOL (Google Path): Using tool name '{simple_tool_name}' (from original '{original_tool_name}') for Gemini.")
+                                pass
+                            else: # No mapping applied, using original name (might be an issue if still mangled or invalid)
+                                logger.warning(f"ASK_TOOL (Google Path): No specific mapping for tool name '{original_tool_name}'. Using as is. Ensure it is valid for Gemini.")
+
+                            # Final validation check (basic) - Gemini API will perform strict validation
+                            if not (simple_tool_name.replace('_', '').replace('-', '').replace('.', '').isalnum() and \
+                                    len(simple_tool_name) <= 63 and \
+                                    (simple_tool_name[0].isalpha() or simple_tool_name[0] == '_')):
+                                logger.error(f"ASK_TOOL (Google Path): Sanitized tool name '{simple_tool_name}' (from original '{original_tool_name}') is STILL LIKELY INVALID for Gemini due to length or characters. Length: {len(simple_tool_name)}")
+                                # Optionally, skip this tool or raise an error to prevent API call with known bad name
+                                # continue # Skips adding this tool declaration
+                            
+                            gemini_tool_declarations.append(
+                                FunctionDeclaration(
+                                    name=simple_tool_name, # Use the sanitized/mapped name
+                                    description=fn_data.get("description", "No description provided."),
+                                    parameters=sanitized_schema, # Use the sanitized schema
+                                )
+                            )
+                        else:
+                            logger.warning(f"ASK_TOOL (Google Path): Skipping malformed tool for Gemini: Name={fn_data.get('name') if fn_data else 'N/A'}, Params_Present={fn_data.get('parameters') is not None if fn_data else False}")
+                
+                gemini_tools_list_for_api = [Tool(function_declarations=gemini_tool_declarations)] if gemini_tool_declarations else None
+                # logger.info(f"ASK_TOOL (Google Path): Tools for Gemini: {gemini_tools_list_for_api}")
+
+                # 3. Generation Config
+                generation_config_params = {}
+                if temperature is not None: generation_config_params["temperature"] = temperature
+                # Gemini uses 'max_output_tokens'. Ensure 'self.max_tokens' is appropriate.
+                if self.max_tokens: generation_config_params["max_output_tokens"] = self.max_tokens
+                final_generation_config = genai.types.GenerationConfig(**generation_config_params) if generation_config_params else None
+
+                logger.info(f"ASK_TOOL (Google Path): Calling generate_content_async with model {self.client.model_name if hasattr(self.client, 'model_name') else 'N/A'}")
+                
+                if not isinstance(self.client, genai.GenerativeModel): # Check type
+                    logger.error(f"ASK_TOOL (Google Path): self.client is NOT a GenerativeModel. It is {type(self.client)}")
+                    raise TypeError("Incorrect client type for Gemini API call.")
+
+                response = await self.client.generate_content_async(
+                    contents=gemini_messages_for_api,
+                    tools=gemini_tools_list_for_api,
+                    generation_config=final_generation_config
                 )
+                logger.info("ASK_TOOL (Google Path): Received response from Gemini.")
 
-            params["stream"] = False  # Always use non-streaming for tool requests
-            response: ChatCompletion = await self.client.chat.completions.create(
-                **params
-            )
+                # 4. Process Gemini Response (Simplified - adapt to your agent's needs)
+                # This should map to a structure similar to ChatCompletionMessage if possible
+                # For now, returning a dictionary.
+                if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
+                    api_response_part = response.candidates[0].content.parts[0]
+                    if hasattr(api_response_part, 'function_call') and api_response_part.function_call:
+                        fc = api_response_part.function_call
+                        logger.info(f"ASK_TOOL (Google Path): Gemini returned function call: {fc.name}")
+                        # Map to your agent's expected tool_calls structure
+                        tool_calls_list = [
+                            LLMToolCall(
+                                id=fc.name, # Or generate a unique ID if needed by your framework
+                                type="function",
+                                function=SchemaFunction(name=fc.name, arguments=json.dumps(dict(fc.args)))
+                            )
+                        ]
+                        return LLMResponseMessage(tool_calls=tool_calls_list, content=None)
+                    elif hasattr(api_response_part, 'text'):
+                        logger.info("ASK_TOOL (Google Path): Gemini returned text response.")
+                        return LLMResponseMessage(content=api_response_part.text, tool_calls=None)
 
-            # Check if response is valid
-            if not response.choices or not response.choices[0].message:
-                print(response)
-                # raise ValueError("Invalid or empty response from LLM")
-                return None
+                logger.warning("ASK_TOOL (Google Path): Gemini response was empty or not in expected format.")
+                # Return a consistent error structure if needed by the agent, wrapped appropriately
+                return LLMResponseMessage(content="Error: Empty or unparseable response from Gemini.", tool_calls=None)
 
-            # Update token counts
-            self.update_token_count(
-                response.usage.prompt_tokens, response.usage.completion_tokens
-            )
+            except Exception as e: # Catch specific google.api_core.exceptions if possible
+                logger.error(f"ASK_TOOL (Google Path): Error during Gemini API call: {e}", exc_info=True)
+                raise # Re-raise to be handled by the agent or a global handler
 
-            return response.choices[0].message
+        else: # Non-Google path (OpenAI, Azure, potentially unhandled)
+            logger.info(f"ASK_TOOL: Executing NON-GOOGLE (Else) path for api_type \'{self.api_type}\'.")
+            try:
+                # This block should contain the logic for OpenAI, Azure, etc.
+                # It's based on the original structure that was leading to errors when misconfigured for Gemini.
 
-        except TokenLimitExceeded:
-            # Re-raise token limit errors without logging
-            raise
-        except ValueError as ve:
-            logger.error(f"Validation error in ask_tool: {ve}")
-            raise
-        except OpenAIError as oe:
-            logger.error(f"OpenAI API error: {oe}")
-            if isinstance(oe, AuthenticationError):
-                logger.error("Authentication failed. Check API key.")
-            elif isinstance(oe, RateLimitError):
-                logger.error("Rate limit exceeded. Consider increasing retry attempts.")
-            elif isinstance(oe, APIError):
-                logger.error(f"API error: {oe}")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error in ask_tool: {e}")
-            raise
+                # Validate tool_choice (if not done globally or if OpenAI specific values are different)
+                # if tool_choice not in TOOL_CHOICE_VALUES: # Assuming TOOL_CHOICE_VALUES is for OpenAI
+                #     raise ValueError(f\"Invalid tool_choice for OpenAI-like API: {tool_choice}\")
+
+                supports_images = self.model in MULTIMODAL_MODELS
+
+                # Format messages for OpenAI-like APIs
+                formatted_messages = []
+                if system_msgs:
+                    formatted_system_msgs = self.format_messages(system_msgs, supports_images)
+                    formatted_messages.extend(formatted_system_msgs)
+                formatted_messages.extend(self.format_messages(messages, supports_images))
+
+                if not formatted_messages:
+                    raise ValueError("No messages to send after formatting for OpenAI-like API.")
+
+                # Calculate input token count for OpenAI-like APIs
+                # input_tokens = self.count_message_tokens(formatted_messages)
+                # tools_tokens_count = 0
+                # if tools:
+                #     for tool_item in tools: tools_tokens_count += self.count_tokens(str(tool_item))
+                # input_tokens += tools_tokens_count
+                # if not self.check_token_limit(input_tokens):
+                #     raise TokenLimitExceeded(self.get_limit_error_message(input_tokens))
+
+                # Validate tools structure for OpenAI-like APIs
+                if tools:
+                    for tool_item in tools:
+                        if not isinstance(tool_item, dict) or "type" not in tool_item or tool_item["type"] != "function" or "function" not in tool_item:
+                            raise ValueError("Each tool for OpenAI-like API must be a dict with type \'function\' and a \'function\' object.")
+
+                params = {
+                    "model": self.model,
+                    "messages": formatted_messages,
+                    "tools": tools, # Assumes \'tools\' is already in OpenAI format
+                    "tool_choice": tool_choice, # Assumes \'tool_choice\' is compatible
+                    "timeout": timeout,
+                    **kwargs,
+                }
+
+                if self.model in REASONING_MODELS:
+                    params["max_completion_tokens"] = self.max_tokens
+                else:
+                    params["max_tokens"] = self.max_tokens
+                current_temp = temperature if temperature is not None else self.temperature
+                if current_temp is not None: # Ensure temperature is only added if set
+                    params["temperature"] = current_temp
+
+                params["stream"] = False # Non-streaming for tool calls
+
+                logger.info(f"ASK_TOOL (Non-Google Path): Calling OpenAI compatible API with param keys: {list(params.keys())}")
+
+                if not isinstance(self.client, AsyncOpenAI) and not isinstance(self.client, AsyncAzureOpenAI) : # Check client type
+                     logger.error(f"ASK_TOOL (Non-Google Path): Expected AsyncOpenAI/AsyncAzureOpenAI client but got {type(self.client)} for api_type \'{self.api_type}\'")
+                     raise TypeError(f"Misconfigured client for api_type \'{self.api_type}\'. Client is {type(self.client)}")
+
+                response: ChatCompletion = await self.client.chat.completions.create(**params)
+
+                if not response.choices or not response.choices[0].message:
+                    logger.error(f"ASK_TOOL (Non-Google Path): Invalid or empty response from LLM: {response}")
+                    return None # Or raise an error
+
+                # Update token counts (if successful)
+                if response.usage:
+                    self.update_token_count(
+                        response.usage.prompt_tokens, response.usage.completion_tokens
+                    )
+
+                return response.choices[0].message # This is a ChatCompletionMessage
+
+            except TokenLimitExceeded: # Catch specific exceptions first
+                # logger.error("ASK_TOOL (Non-Google Path): Token limit exceeded.") # Already logged by check_token_limit usually
+                raise
+            except ValueError as ve:
+                logger.error(f"ASK_TOOL (Non-Google Path): Validation error: {ve}", exc_info=True)
+                raise
+            except OpenAIError as oe: # This is where the original error was logged (lines 756, 762)
+                logger.error(f"ASK_TOOL (Non-Google Path): OpenAI API error: {oe}", exc_info=True)
+                # Specific OpenAI error type logging can be re-added here if desired
+                # if isinstance(oe, AuthenticationError): logger.error("...")
+                # elif isinstance(oe, RateLimitError): logger.error("...")
+                # elif isinstance(oe, APIError): logger.error("...")
+                raise
+            except Exception as e:
+                logger.error(f"ASK_TOOL (Non-Google Path): Unexpected error: {e}", exc_info=True)
+                raise

@@ -163,9 +163,9 @@ class ToolCallAgent(ReActAgent):
 
         return "\n\n".join(results)
 
-    async def execute_tool(self, command: ToolCall) -> str:
+    async def execute_tool(self, command: ToolCall) -> str: # command is actually LLMToolCall at runtime
         """Execute a single tool call with robust error handling"""
-        if not command or not command.function or not command.function.name:
+        if not command or not command.function or not command.function.name: # command.function is a Pydantic model (SchemaFunction)
             return "Error: Invalid command format"
 
         name = command.function.name
