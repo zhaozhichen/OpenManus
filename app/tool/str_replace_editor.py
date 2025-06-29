@@ -345,6 +345,18 @@ class StrReplaceEditor(BaseTool):
         operator: FileOperator = None,
     ) -> CLIResult:
         """Insert text at a specific line in a file."""
+        # Ensure insert_line is an int
+        if isinstance(insert_line, str):
+            try:
+                # Accept both integer and float strings
+                if "." in insert_line:
+                    insert_line = int(float(insert_line))
+                else:
+                    insert_line = int(insert_line)
+            except Exception:
+                raise ToolError(f"Invalid insert_line value: {insert_line}")
+        elif isinstance(insert_line, float):
+            insert_line = int(insert_line)
         # Read and prepare content
         file_text = (await operator.read_file(path)).expandtabs()
         new_str = new_str.expandtabs()
