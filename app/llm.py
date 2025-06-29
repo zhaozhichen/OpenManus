@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field # Ensure BaseModel and Field are imported
 import tiktoken
 import google.generativeai as genai
 # GenerativeModel is now accessed via genai.GenerativeModel
-from google.generativeai.types import FunctionDeclaration, Tool 
+from google.generativeai.types import FunctionDeclaration, Tool
 
 from openai import (
     APIError,
@@ -36,6 +36,7 @@ from app.schema import (
     Message,
     ToolChoice,
     Function as SchemaFunction, # Import Function and alias it
+    Role, # Import Role enum
 )
 
 # Helper Pydantic models for consistent LLM response structure
@@ -210,15 +211,15 @@ class LLM:
     @staticmethod
     def _sanitize_schema_for_gemini(data: Any) -> Any:
         """
-        Recursively remove all keys named 'title' or 'default' from a nested dictionary or list of dictionaries.
+        Recursively remove all keys named 'title', 'default', or 'dependencies' from a nested dictionary or list of dictionaries.
         This is used to sanitize JSON schemas for APIs like Gemini that don't support these fields in function parameter schemas.
         """
         if isinstance(data, dict):
             new_dict = {}
             for k, v in data.items():
-                if k == "title" or k == "default":  # Skip 'title' and 'default' keys
+                if k in ("title", "default", "dependencies", "additionalProperties"):
                     continue
-                new_dict[k] = LLM._sanitize_schema_for_gemini(v)  # Recurse
+                new_dict[k] = LLM._sanitize_schema_for_gemini(v)
             return new_dict
         elif isinstance(data, list):
             return [LLM._sanitize_schema_for_gemini(item) for item in data]
@@ -301,7 +302,7 @@ class LLM:
                 else:
                     logger.error(f"LLM.__init__: Unsupported api_type: '{self.api_type}'")
                     raise ValueError(f"Unsupported api_type: {self.api_type}")
-            
+
                 # logger.info(f"LLM.__init__: Final self.client type: {type(self.client)}")
                 self.token_counter = TokenCounter(self.tokenizer)
             else:
@@ -465,23 +466,15 @@ class LLM:
             Exception: For unexpected errors
         """
         try:
-            # Check if the model supports images
             supports_images = self.model in MULTIMODAL_MODELS
-
-            # Format system and user messages with image support check
             if system_msgs:
                 system_msgs = self.format_messages(system_msgs, supports_images)
                 messages = system_msgs + self.format_messages(messages, supports_images)
             else:
                 messages = self.format_messages(messages, supports_images)
-
-            # Calculate input token count
             input_tokens = self.count_message_tokens(messages)
-
-            # Check if token limits are exceeded
             if not self.check_token_limit(input_tokens):
                 error_message = self.get_limit_error_message(input_tokens)
-                # Raise a special exception that won't be retried
                 raise TokenLimitExceeded(error_message)
 
             params = {
@@ -493,52 +486,67 @@ class LLM:
                 params["max_completion_tokens"] = self.max_tokens
             else:
                 params["max_tokens"] = self.max_tokens
-                params["temperature"] = (
-                    temperature if temperature is not None else self.temperature
+                params["temperature"] = temperature if temperature is not None else self.temperature
+
+            if self.api_type == "google":
+                # Gemini expects 'contents' instead of 'messages', and different structure
+                gemini_content_history = []
+                for message in messages:
+                    role = message.get("role") if isinstance(message, dict) else message.role
+                    content = message.get("content") if isinstance(message, dict) else message.content
+                    if role and content is not None:
+                        gemini_content_history.append({
+                            "role": map_role_for_gemini(role),
+                            "parts": [{"text": content}]
+                        })
+                generation_config_params = {}
+                if temperature is not None:
+                    generation_config_params["temperature"] = temperature
+                if self.max_tokens:
+                    generation_config_params["max_output_tokens"] = self.max_tokens
+                # Use the Gemini API
+                response = await self.client.generate_content_async(
+                    contents=gemini_content_history,
+                    generation_config=generation_config_params if generation_config_params else None
                 )
-
-            if not stream:
-                # Non-streaming request
-                response = await self.client.chat.completions.create(
-                    **params, stream=False
+                logger.debug(f"Gemini raw response: {str(response)}")
+                if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
+                    api_response_part = response.candidates[0].content.parts[0]
+                    if hasattr(api_response_part, 'text'):
+                        logger.info(f"ASK (Google Path): Gemini returned text response: {api_response_part.text}")
+                        return api_response_part.text
+                logger.warning("ASK (Google Path): Gemini response was empty or not in expected format.")
+                return "Error: Empty or unparseable response from Gemini."
+            else:
+                if not stream:
+                    response = await self.client.chat.completions.create(
+                        **params, stream=False
+                    )
+                    if not response.choices or not response.choices[0].message.content:
+                        raise ValueError("Empty or invalid response from LLM")
+                    self.update_token_count(
+                        response.usage.prompt_tokens, response.usage.completion_tokens
+                    )
+                    return response.choices[0].message.content
+                self.update_token_count(input_tokens)
+                response = await self.client.chat.completions.create(**params, stream=True)
+                collected_messages = []
+                completion_text = ""
+                async for chunk in response:
+                    chunk_message = chunk.choices[0].delta.content or ""
+                    collected_messages.append(chunk_message)
+                    completion_text += chunk_message
+                    print(chunk_message, end="", flush=True)
+                print()  # Newline after streaming
+                full_response = "".join(collected_messages).strip()
+                if not full_response:
+                    raise ValueError("Empty response from streaming LLM")
+                completion_tokens = self.count_tokens(completion_text)
+                logger.info(
+                    f"Estimated completion tokens for streaming response: {completion_tokens}"
                 )
-
-                if not response.choices or not response.choices[0].message.content:
-                    raise ValueError("Empty or invalid response from LLM")
-
-                # Update token counts
-                self.update_token_count(
-                    response.usage.prompt_tokens, response.usage.completion_tokens
-                )
-
-                return response.choices[0].message.content
-
-            # Streaming request, For streaming, update estimated token count before making the request
-            self.update_token_count(input_tokens)
-
-            response = await self.client.chat.completions.create(**params, stream=True)
-
-            collected_messages = []
-            completion_text = ""
-            async for chunk in response:
-                chunk_message = chunk.choices[0].delta.content or ""
-                collected_messages.append(chunk_message)
-                completion_text += chunk_message
-                print(chunk_message, end="", flush=True)
-
-            print()  # Newline after streaming
-            full_response = "".join(collected_messages).strip()
-            if not full_response:
-                raise ValueError("Empty response from streaming LLM")
-
-            # estimate completion tokens for streaming response
-            completion_tokens = self.count_tokens(completion_text)
-            logger.info(
-                f"Estimated completion tokens for streaming response: {completion_tokens}"
-            )
-            self.total_completion_tokens += completion_tokens
-
-            return full_response
+                self.total_completion_tokens += completion_tokens
+                return full_response
 
         except TokenLimitExceeded:
             # Re-raise token limit errors without logging
@@ -766,94 +774,109 @@ class LLM:
         if self.api_type == "google":
             logger.info("ASK_TOOL: Executing GOOGLE specific path.")
             try:
-                # logger.info("ASK_TOOL (Google Path): Preparing to call Gemini.")
-
-                # 1. Format messages for Gemini
-                gemini_messages_for_api = []
-                # Combine system messages and regular messages
+                gemini_content_history = []
                 all_input_messages = (system_msgs or []) + messages
+
                 if not all_input_messages:
                     logger.error("ASK_TOOL (Google Path): No messages provided to send to Gemini.")
                     raise ValueError("Messages list is empty for Gemini call")
 
                 for msg_item in all_input_messages:
-                    # Gemini expects 'user' or 'model' roles. Adapt your Message object's role.
-                    # Assuming msg_item has 'role' and 'content' attributes.
-                    # This is a basic mapping; adjust if your Message structure is different.
-                    role = "user" if msg_item.role in ["user", "system"] else "model"
-                    if not hasattr(msg_item, 'content') or not msg_item.content:
-                        logger.warning(f"ASK_TOOL (Google Path): Skipping message with no content: {msg_item}")
+                    if isinstance(msg_item, dict):
+                        msg_role_val = msg_item.get("role")
+                        msg_content_val = msg_item.get("content")
+                        if msg_role_val == Role.TOOL.value:
+                            tool_name_val = msg_item.get("name")
+                            if tool_name_val and msg_content_val:
+                                gemini_content_history.append({
+                                    "role": "tool",
+                                    "parts": [{"function_response": {"name": tool_name_val, "response": {"content": msg_content_val}}}]
+                                })
+                            continue
+                        elif not msg_role_val or (msg_content_val is None and not msg_item.get("tool_calls")):
+                            continue
+                        current_role_val = map_role_for_gemini(msg_role_val)
+                        gemini_content_history.append({
+                            "role": current_role_val,
+                            "parts": [{"text": msg_content_val or ""}]
+                        })
                         continue
-                    gemini_messages_for_api.append({'role': role, 'parts': [{'text': msg_item.content}]})
-
-                if not gemini_messages_for_api: # Check again after filtering
+                    if msg_item.role == Role.TOOL:
+                        if msg_item.name and msg_item.content is not None:
+                            gemini_content_history.append({
+                                "role": "tool",
+                                "parts": [{"function_response": {"name": msg_item.name, "response": {"content": msg_item.content}}}]
+                            })
+                    elif msg_item.role in [Role.USER, Role.SYSTEM]:
+                        if msg_item.content is not None:
+                            gemini_content_history.append({
+                                "role": map_role_for_gemini(msg_item.role),
+                                "parts": [{"text": msg_item.content}]
+                            })
+                    elif msg_item.role == Role.ASSISTANT:
+                        if msg_item.tool_calls:
+                            tool_call_parts = []
+                            for tc in msg_item.tool_calls:
+                                if tc.function and tc.function.name and tc.function.arguments is not None:
+                                    try:
+                                        tool_args = json.loads(tc.function.arguments)
+                                        tool_call_parts.append({"function_call": {"name": tc.function.name, "args": tool_args}})
+                                    except json.JSONDecodeError:
+                                        logger.error(f"ASK_TOOL (Google Path): Failed to parse arguments for function call {tc.function.name}: {tc.function.arguments}", exc_info=True)
+                            if tool_call_parts:
+                                gemini_content_history.append({
+                                    "role": map_role_for_gemini(msg_item.role),
+                                    "parts": tool_call_parts
+                                })
+                            elif msg_item.content is not None:
+                                gemini_content_history.append({
+                                    "role": map_role_for_gemini(msg_item.role),
+                                    "parts": [{"text": msg_item.content}]
+                                })
+                        elif msg_item.content is not None:
+                            gemini_content_history.append({
+                                "role": map_role_for_gemini(msg_item.role),
+                                "parts": [{"text": msg_item.content}]
+                            })
+                if not gemini_content_history:
                     logger.error("ASK_TOOL (Google Path): No valid messages to send after formatting for Gemini.")
                     raise ValueError("No valid messages to send to Gemini after formatting.")
 
-                # 2. Format tools for Gemini
+                # 2. Format tools for Gemini (This part seems correct from previous logs)
                 gemini_tool_declarations = []
                 if tools:
                     for mcp_tool_param in tools:
                         fn_data = mcp_tool_param.get("function")
-                        if fn_data and fn_data.get("name") and fn_data.get("parameters") is not None: # Ensure parameters key exists
+                        if fn_data and fn_data.get("name") and fn_data.get("parameters") is not None:
                             original_schema = fn_data["parameters"]
-                            # logger.info(f"ASK_TOOL (Google Path): Processing tool '{fn_data['name']}'. Original parameters schema: {json.dumps(original_schema, indent=2)}")
-                            
-                            # Sanitize the schema by removing "title" and "default" fields
+                            # Sanitize the schema by removing "title", "default", and "dependencies"
                             sanitized_schema = LLM._sanitize_schema_for_gemini(original_schema)
-                            # logger.info(f"ASK_TOOL (Google Path): Tool '{fn_data['name']}'. Sanitized parameters schema for Gemini: {json.dumps(sanitized_schema, indent=2)}")
-
-                            # Sanitize tool name for Gemini
+                            logger.debug(f"Sanitized schema for Gemini: {json.dumps(sanitized_schema, indent=2)}")
                             original_tool_name = fn_data["name"]
-                            simple_tool_name = original_tool_name # Default to original
-
-                            # Define mappings from observed suffixes to simple names
-                            # These simple names should match actual tool capabilities and Gemini requirements.
+                            simple_tool_name = original_tool_name
                             TOOL_NAME_SUFFIX_MAP = {
                                 "_ba": "bash",
-                                "_br": "browser_use", 
+                                "_br": "browser_use",
                                 "_st": "str_replace_editor",
                                 "_te": "terminate"
                             }
-                            
-                            # Attempt to map using suffix if the name seems mangled
-                            # Check for a length that suggests it's a mangled name before trying suffix.
-                            # A simple heuristic: if it contains '/' or is very long.
-                            # For now, we'll rely on the suffix for known mangled forms.
                             mapped = False
                             for suffix, mapped_name in TOOL_NAME_SUFFIX_MAP.items():
                                 if original_tool_name.endswith(suffix):
                                     simple_tool_name = mapped_name
                                     mapped = True
                                     break
-                            
-                            if mapped:
-                                # logger.info(f"ASK_TOOL (Google Path): Mapped tool name '{original_tool_name}' to '{simple_tool_name}' for Gemini.")
-                                pass # Name was mapped, proceed
-                            elif simple_tool_name != original_tool_name: # If it was changed by some other logic not shown
-                                # logger.info(f"ASK_TOOL (Google Path): Using tool name '{simple_tool_name}' (from original '{original_tool_name}') for Gemini.")
-                                pass
-                            else: # No mapping applied, using original name (might be an issue if still mangled or invalid)
-                                logger.warning(f"ASK_TOOL (Google Path): No specific mapping for tool name '{original_tool_name}'. Using as is. Ensure it is valid for Gemini.")
-
-                            # Final validation check (basic) - Gemini API will perform strict validation
-                            if not (simple_tool_name.replace('_', '').replace('-', '').replace('.', '').isalnum() and \
-                                    len(simple_tool_name) <= 63 and \
-                                    (simple_tool_name[0].isalpha() or simple_tool_name[0] == '_')):
-                                logger.error(f"ASK_TOOL (Google Path): Sanitized tool name '{simple_tool_name}' (from original '{original_tool_name}') is STILL LIKELY INVALID for Gemini due to length or characters. Length: {len(simple_tool_name)}")
-                                # Optionally, skip this tool or raise an error to prevent API call with known bad name
-                                # continue # Skips adding this tool declaration
-                            
-                            gemini_tool_declarations.append(
-                                FunctionDeclaration(
-                                    name=simple_tool_name, # Use the sanitized/mapped name
-                                    description=fn_data.get("description", "No description provided."),
-                                    parameters=sanitized_schema, # Use the sanitized schema
-                                )
-                            )
+                            gemini_tool_declarations.append({
+                                "name": simple_tool_name,
+                                "description": fn_data.get("description", "No description provided."),
+                                "parameters": sanitized_schema
+                            })
                         else:
                             logger.warning(f"ASK_TOOL (Google Path): Skipping malformed tool for Gemini: Name={fn_data.get('name') if fn_data else 'N/A'}, Params_Present={fn_data.get('parameters') is not None if fn_data else False}")
-                
+
+                # After building gemini_tool_declarations, log the full list
+                logger.debug(f"Final tool declarations for Gemini: {json.dumps(gemini_tool_declarations, indent=2)}")
+
                 gemini_tools_list_for_api = [Tool(function_declarations=gemini_tool_declarations)] if gemini_tool_declarations else None
                 # logger.info(f"ASK_TOOL (Google Path): Tools for Gemini: {gemini_tools_list_for_api}")
 
@@ -865,45 +888,46 @@ class LLM:
                 final_generation_config = genai.types.GenerationConfig(**generation_config_params) if generation_config_params else None
 
                 logger.info(f"ASK_TOOL (Google Path): Calling generate_content_async with model {self.client.model_name if hasattr(self.client, 'model_name') else 'N/A'}")
-                
+
                 if not isinstance(self.client, genai.GenerativeModel): # Check type
                     logger.error(f"ASK_TOOL (Google Path): self.client is NOT a GenerativeModel. It is {type(self.client)}")
                     raise TypeError("Incorrect client type for Gemini API call.")
 
                 response = await self.client.generate_content_async(
-                    contents=gemini_messages_for_api,
+                    contents=gemini_content_history, # Use the new list name
                     tools=gemini_tools_list_for_api,
                     generation_config=final_generation_config
                 )
                 logger.info("ASK_TOOL (Google Path): Received response from Gemini.")
 
-                # 4. Process Gemini Response (Simplified - adapt to your agent's needs)
-                # This should map to a structure similar to ChatCompletionMessage if possible
-                # For now, returning a dictionary.
+                # After receiving the Gemini response, avoid serializing the full response object
+                logger.debug(f"Gemini raw response: {str(response)}")
+                # When processing the response, extract only serializable fields
                 if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
                     api_response_part = response.candidates[0].content.parts[0]
                     if hasattr(api_response_part, 'function_call') and api_response_part.function_call:
                         fc = api_response_part.function_call
                         logger.info(f"ASK_TOOL (Google Path): Gemini returned function call: {fc.name}")
-                        # Map to your agent's expected tool_calls structure
+                        logger.debug(f"fc.args type: {type(fc.args)}, repr: {repr(fc.args)}")
+                        tool_args = to_serializable(fc.args)
+                        logger.debug(f"Serialized tool_args: {tool_args}")
                         tool_calls_list = [
                             LLMToolCall(
-                                id=fc.name, # Or generate a unique ID if needed by your framework
+                                id=fc.name,
                                 type="function",
-                                function=SchemaFunction(name=fc.name, arguments=json.dumps(dict(fc.args)))
+                                function=SchemaFunction(name=fc.name, arguments=json.dumps(tool_args))
                             )
                         ]
                         return LLMResponseMessage(tool_calls=tool_calls_list, content=None)
                     elif hasattr(api_response_part, 'text'):
-                        logger.info("ASK_TOOL (Google Path): Gemini returned text response.")
+                        logger.info(f"ASK_TOOL (Google Path): Gemini returned text response: {api_response_part.text}")
                         return LLMResponseMessage(content=api_response_part.text, tool_calls=None)
-
                 logger.warning("ASK_TOOL (Google Path): Gemini response was empty or not in expected format.")
-                # Return a consistent error structure if needed by the agent, wrapped appropriately
                 return LLMResponseMessage(content="Error: Empty or unparseable response from Gemini.", tool_calls=None)
 
             except Exception as e: # Catch specific google.api_core.exceptions if possible
                 logger.error(f"ASK_TOOL (Google Path): Error during Gemini API call: {e}", exc_info=True)
+                raise
                 raise # Re-raise to be handled by the agent or a global handler
 
         else: # Non-Google path (OpenAI, Azure, potentially unhandled)
@@ -998,3 +1022,32 @@ class LLM:
             except Exception as e:
                 logger.error(f"ASK_TOOL (Non-Google Path): Unexpected error: {e}", exc_info=True)
                 raise
+
+def to_serializable(obj):
+    try:
+        from google.protobuf.json_format import MessageToDict
+        if hasattr(obj, 'DESCRIPTOR'):
+            return MessageToDict(obj, preserving_proto_field_name=True)
+    except ImportError:
+        pass
+    if hasattr(obj, 'to_dict'):
+        return obj.to_dict()
+    elif isinstance(obj, dict):
+        return {k: to_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [to_serializable(i) for i in obj]
+    elif hasattr(obj, '__iter__') and not isinstance(obj, str):
+        try:
+            return {k: to_serializable(v) for k, v in dict(obj).items()}
+        except Exception:
+            return str(obj)
+    else:
+        return str(obj)
+
+def map_role_for_gemini(role: str) -> str:
+    """Map OpenAI roles to Gemini-compatible roles."""
+    if role == "system":
+        return "user"
+    if role == "assistant":
+        return "model"
+    return role
